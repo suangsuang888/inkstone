@@ -33,9 +33,9 @@ export const notesRoutes = new Hono<AppBindings>()
 notesRoutes.use('*', requireAuth)
 
 
-const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000
+export const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000
 
-const SNAPSHOT_DIFF_THRESHOLD = 400
+export const SNAPSHOT_DIFF_THRESHOLD = 400
 
 interface NotesListCursor {
   view: ViewKind

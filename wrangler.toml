@@ -3,6 +3,10 @@ main = "src/worker/index.ts"
 compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
+# Custom domain (required: Worker-to-Worker fetch to *.workers.dev returns 404 / error 1042;
+# the Telegram bridge must call Inkstone via this domain)
+routes = [{ pattern = "inkstone.668816.xyz", custom_domain = true }]
+
 [assets]
 directory = "./dist/client"
 binding = "ASSETS"

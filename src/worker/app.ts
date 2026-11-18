@@ -3,6 +3,7 @@ import { initializeDatabase } from './db/schema'
 import { ApiError, errorResponse } from './lib/errors'
 import { loadSession, requireClientHeader } from './middleware/auth'
 import { authRoutes } from './routes/auth'
+import { davRoutes } from './routes/dav'
 import { totpRoutes } from './routes/totp'
 import { notesRoutes } from './routes/notes'
 import { foldersRoutes } from './routes/folders'
@@ -100,6 +101,7 @@ export function createApp() {
   app.route('/api/share', shareManageRoutes)
   app.route('/api/public', shareRoutes)
   app.route('/api', transferRoutes)
+  app.route('/dav', davRoutes)
 
   app.all('/api/*', () => {
     throw ApiError.notFound('API endpoint not found')

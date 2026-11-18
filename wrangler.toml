@@ -20,6 +20,8 @@ run_worker_first = [
   "/mcp",
   "/mcp/*",
   "/.well-known/*",
+  "/dav",
+  "/dav/*",
 ]
 
 [[d1_databases]]

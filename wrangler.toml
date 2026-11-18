@@ -3,9 +3,6 @@ main = "src/worker/index.ts"
 compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 
-# Custom domain (required: Worker-to-Worker fetch to *.workers.dev returns 404 / error 1042;
-# the Telegram bridge must call Inkstone via this domain)
-routes = [{ pattern = "inkstone.668816.xyz", custom_domain = true }]
 
 [assets]
 directory = "./dist/client"
@@ -31,7 +28,7 @@ run_worker_first = [
 [[d1_databases]]
 binding = "DB"
 database_name = "inkstone-db"
-database_id = "f363f341-ad56-4708-b931-acf2b2c87cb2"
+database_id = "76dd314d-b552-406d-b842-510150ad03f1"
 
 [[r2_buckets]]
 binding = "FILES"
@@ -39,7 +36,7 @@ bucket_name = "inkstone-files"
 
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "ab62989635f143dfbf0919e66718531e"
+id = "c706235d576b48a69ccde55980f9c8ec"
 
 [[durable_objects.bindings]]
 name = "SYNC_HUB"

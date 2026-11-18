@@ -3,6 +3,22 @@ import { LIMITS } from '@shared/constants'
 import { countText, deriveExcerpt } from '@shared/markdown-utils'
 import { truncateText, utf8ByteLength } from '@shared/text-utils'
 import type { AppBindings } from '../env'
+import { drainAttachmentCleanup } from '../attachments/cleanup'
+import {
+  deleteAttachmentObjects,
+  putAttachmentObject,
+  readAttachmentObject,
+  readAttachmentObjectStream,
+} from '../attachments/backend'
+import {
+  attachmentCleanupTarget,
+  attachmentObjectKey,
+  type AttachmentObjectStorage,
+} from '../attachments/keys'
+import {
+  persistAttachmentWithinQuota,
+  sanitizeAttachmentFilename,
+} from '../attachments/storage'
 import { initializeDatabase } from '../db/schema'
 import { NOTE_COLUMNS_FULL, splitTags, type FolderRow, type NoteRow } from '../db/rows'
 import {
@@ -13,6 +29,7 @@ import {
 import { sha256Hex } from '../lib/encoding'
 import { ApiError } from '../lib/errors'
 import { newId } from '../lib/id'
+import { isInlineSafe } from '../lib/image'
 import { broadcastCursor, scheduleFtsDrain } from '../lib/notify'
 import {
   dummyVerify,
@@ -118,10 +135,21 @@ export function parseDestination(
   return parseDavPath(url.pathname)
 }
 
+export interface DavAttachmentRow {
+  id: string
+  note_id: string | null
+  filename: string
+  mime: string
+  size: number
+  storage: AttachmentObjectStorage
+  created_at: number
+}
+
 type DavTarget =
   | { kind: 'root' }
   | { kind: 'folder'; folder: FolderRow }
   | { kind: 'note'; note: NoteRow }
+  | { kind: 'attachment'; note: NoteRow; attachment: DavAttachmentRow }
   | { kind: 'absent'; parentId: string | null; leaf: string }
   | { kind: 'broken' }
 
@@ -131,6 +159,121 @@ interface PropfindEntry {
   isCollection: boolean
   contentLength: number | null
   lastModified: number
+  contentType?: string
+}
+
+/** File name without its last extension ("backup.zip" -> "backup", "backup" -> "backup"). */
+export function fileStem(filename: string): string | null {
+  const dot = filename.lastIndexOf('.')
+  if (dot === 0) return null
+  if (dot === -1) return filename ? filename : null
+  const stem = filename.slice(0, dot)
+  return stem ? stem : null
+}
+
+/** Note title a DAV attachment file maps to (same folder, stem as title). */
+export function davNoteTitleForFile(filename: string): string | null {
+  const stem = fileStem(filename)
+  if (stem === null) return null
+  const title = truncateText(sanitizeTitle(stem).trim(), LIMITS.titleMaxLength)
+  return title ? title : null
+}
+
+export function attachmentLinkLine(filename: string, attachmentId: string): string {
+  return `[${filename}](/api/files/${attachmentId})`
+}
+
+const DAV_ATTACHMENT_LINE_RE = /^\[(.+)\]\(\/api\/files\/([0-9a-hjkmnp-tv-z]{26})\)$/
+
+export interface DavAttachmentLink {
+  filename: string
+  id: string
+}
+
+/**
+ * Parses a note body that consists only of attachment link lines.
+ * Returns null when any non-empty line is not such a link, i.e. the note
+ * carries user-written content and is not a DAV-managed attachment index.
+ */
+export function parseDavAttachmentLines(
+  content: string,
+): DavAttachmentLink[] | null {
+  const lines: DavAttachmentLink[] = []
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const match = DAV_ATTACHMENT_LINE_RE.exec(trimmed)
+    if (!match) return null
+    lines.push({ filename: match[1]!, id: match[2]! })
+  }
+  return lines
+}
+
+/** Replace the link line for `filename`, or append it when it is missing. */
+export function withAttachmentLink(
+  content: string,
+  filename: string,
+  attachmentId: string,
+): string {
+  const line = attachmentLinkLine(filename, attachmentId)
+  if (!content.trim()) return line
+  const lines = content.replace(/\n+$/, '').split('\n')
+  let replaced = false
+  const updated = lines.map((current) => {
+    const match = DAV_ATTACHMENT_LINE_RE.exec(current.trim())
+    if (match && match[1] === filename) {
+      replaced = true
+      return line
+    }
+    return current
+  })
+  if (!replaced) updated.push(line)
+  return updated.join('\n')
+}
+
+/** Remove the link line for `filename` from a note body. */
+export function withoutAttachmentLink(content: string, filename: string): string {
+  return content
+    .split('\n')
+    .filter((line) => {
+      const match = DAV_ATTACHMENT_LINE_RE.exec(line.trim())
+      return !(match && match[1] === filename)
+    })
+    .join('\n')
+    .replace(/\n+$/, '')
+}
+
+/**
+ * Reported MIME for a DAV attachment upload. WebDAV clients often send no
+ * Content-Type or a generic application/octet-stream; derive a precise type
+ * from the extension when the header carries no better information, so the
+ * stored attachment keeps its real type (e.g. application/zip).
+ */
+export function davReportedMime(filename: string, header: string | undefined): string {
+  const reported = (header ?? '').trim().toLowerCase().split(';', 1)[0]
+  if (reported && reported !== 'application/octet-stream') return reported
+  const extension = filename.slice(filename.lastIndexOf('.') + 1).toLowerCase()
+  const byExtension: Record<string, string> = {
+    zip: 'application/zip',
+    pdf: 'application/pdf',
+    json: 'application/json',
+    txt: 'text/plain',
+    md: 'text/markdown',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    avif: 'image/avif',
+    svg: 'image/svg+xml',
+  }
+  return byExtension[extension] ?? 'application/octet-stream'
+}
+
+function encodeContentDispositionFilename(filename: string): string {
+  return encodeURIComponent(filename).replace(/['()*]/g, (character) => {
+    return `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  })
 }
 
 interface FolderGraphRow {
@@ -293,7 +436,158 @@ async function resolveTarget(
   }
   const folder = await loadFolderByName(db, userId, parentId, leaf)
   if (folder) return { kind: 'folder', folder }
+  const attachment = await loadDavAttachment(db, userId, parentId, leaf)
+  if (attachment) {
+    return { kind: 'attachment', note: attachment.note, attachment: attachment.attachment }
+  }
   return { kind: 'absent', parentId, leaf }
+}
+
+async function loadAttachmentByFilename(
+  db: D1Database,
+  userId: string,
+  noteId: string,
+  filename: string,
+): Promise<DavAttachmentRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, note_id, filename, mime, size, storage, created_at FROM attachments
+        WHERE user_id = ?1 AND note_id = ?2 AND filename = ?3
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+    )
+    .bind(userId, noteId, filename)
+    .first<DavAttachmentRow>()
+  return row ?? null
+}
+
+async function loadNoteAttachments(
+  db: D1Database,
+  userId: string,
+  noteId: string,
+): Promise<DavAttachmentRow[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT id, note_id, filename, mime, size, storage, created_at FROM attachments
+        WHERE user_id = ?1 AND note_id = ?2 ORDER BY created_at ASC, id ASC`,
+    )
+    .bind(userId, noteId)
+    .all<DavAttachmentRow>()
+  return results
+}
+
+async function reloadNote(
+  db: D1Database,
+  userId: string,
+  noteId: string,
+): Promise<NoteRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT ${NOTE_COLUMNS_FULL} FROM notes n
+        WHERE n.user_id = ?1 AND n.id = ?2 AND n.deleted_at IS NULL`,
+    )
+    .bind(userId, noteId)
+    .first<NoteRow>()
+  return row ?? null
+}
+
+/** Find the DAV attachment for a non-.md leaf, if its host note and file exist. */
+async function loadDavAttachment(
+  db: D1Database,
+  userId: string,
+  parentId: string | null,
+  leaf: string,
+): Promise<{ note: NoteRow; attachment: DavAttachmentRow } | null> {
+  const title = davNoteTitleForFile(leaf)
+  if (title === null) return null
+  const note = await loadNoteByTitle(db, userId, parentId, title)
+  if (!note) return null
+  const attachment = await loadAttachmentByFilename(
+    db,
+    userId,
+    note.id,
+    sanitizeAttachmentFilename(leaf),
+  )
+  if (!attachment) return null
+  return { note, attachment }
+}
+
+/**
+ * Delete an attachment row and queue its stored object for cleanup, mirroring
+ * the /api/files delete flow. The object itself is removed by the drain that
+ * follows; failures to drain are retried later by the maintenance cron.
+ */
+async function deleteAttachmentRow(
+  env: AppBindings['Bindings'],
+  userId: string,
+  row: DavAttachmentRow,
+): Promise<void> {
+  const key = attachmentObjectKey({
+    user_id: userId,
+    id: row.id,
+    mime: row.mime,
+    filename: row.filename,
+  })
+  const db = env.DB
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO attachment_cleanup (object_key, user_id, created_at)
+       SELECT ?1, user_id, ?2 FROM attachments WHERE id = ?3 AND user_id = ?4`,
+    ).bind(attachmentCleanupTarget(row.storage, key), Date.now(), row.id, userId),
+    db.prepare(
+      `DELETE FROM import_mappings
+        WHERE user_id = ?1 AND entity = 'attachment' AND target_id = ?2`,
+    ).bind(userId, row.id),
+    db.prepare(`DELETE FROM attachments WHERE id = ?1 AND user_id = ?2`).bind(row.id, userId),
+  ])
+  if (!results.at(-1)?.meta.changes) throw ApiError.notFound('Attachment not found')
+  await drainAttachmentCleanup(env, userId).catch((error) => {
+    console.warn('[inkstone] DAV attachment cleanup will retry later:', error)
+  })
+}
+
+/**
+ * Rename an attachment file. The stored object key is derived from the file
+ * extension, so when the extension changes the object is copied to its new
+ * key first and the old key deleted; same-extension renames keep the object.
+ */
+async function renameAttachmentFile(
+  env: AppBindings['Bindings'],
+  userId: string,
+  row: DavAttachmentRow,
+  newFilename: string,
+): Promise<DavAttachmentRow> {
+  const oldKey = attachmentObjectKey({
+    user_id: userId,
+    id: row.id,
+    mime: row.mime,
+    filename: row.filename,
+  })
+  const newKey = attachmentObjectKey({
+    user_id: userId,
+    id: row.id,
+    mime: row.mime,
+    filename: newFilename,
+  })
+  if (oldKey !== newKey) {
+    const bytes = await readAttachmentObject(env, row.storage, oldKey)
+    if (bytes === null) throw ApiError.notFound('Attachment data is missing')
+    await putAttachmentObject(env, row.storage, newKey, bytes, {
+      userId,
+      objectId: row.id,
+      kind: 'attachment',
+      filename: newFilename,
+      mime: row.mime,
+      sha256: await sha256Hex(bytes),
+    })
+    await deleteAttachmentObjects(env, row.storage, [oldKey])
+  }
+  const updated = await env.DB.prepare(
+    `UPDATE attachments SET filename = ?1 WHERE id = ?2 AND user_id = ?3`,
+  )
+    .bind(newFilename, row.id, userId)
+    .run()
+  if (!updated.meta.changes) throw ApiError.notFound('Attachment not found')
+  return { ...row, filename: newFilename }
 }
 
 async function loadFolderGraph(db: D1Database, userId: string): Promise<FolderGraphRow[]> {
@@ -373,7 +667,7 @@ function buildMultistatus(entries: PropfindEntry[]): string {
           `<D:resourcetype><D:collection/></D:resourcetype>`
         : `<D:displayname>${escapeXml(entry.displayName)}</D:displayname>` +
           `<D:getcontentlength>${entry.contentLength ?? 0}</D:getcontentlength>` +
-          `<D:getcontenttype>text/markdown</D:getcontenttype>` +
+          `<D:getcontenttype>${escapeXml(entry.contentType ?? 'text/markdown')}</D:getcontenttype>` +
           `<D:getlastmodified>${formatHttpDate(entry.lastModified)}</D:getlastmodified>` +
           `<D:resourcetype/>`
       return (
@@ -433,6 +727,30 @@ async function listChildren(
       lastModified: note.updated_at,
     })
   }
+  // Attachments are visible in DAV only when their file stem maps back to
+  // their host note's title, so every listed file can be fetched by its path.
+  const { results: attachments } = await db
+    .prepare(
+      `SELECT a.filename, a.mime, a.size, a.created_at, n.title AS note_title
+         FROM attachments a JOIN notes n ON n.id = a.note_id
+        WHERE a.user_id = ?1 AND n.user_id = ?1 AND n.folder_id IS ?2 AND n.deleted_at IS NULL
+        ORDER BY a.filename COLLATE NOCASE ASC`,
+    )
+    .bind(userId, folderId)
+    .all<{ filename: string; mime: string; size: number; created_at: number; note_title: string }>()
+  for (const attachment of attachments) {
+    if (davNoteTitleForFile(attachment.filename) !== attachment.note_title) continue
+    if (seen.has(attachment.filename)) continue
+    seen.add(attachment.filename)
+    entries.push({
+      href: davHref([...parentSegments, attachment.filename], false),
+      displayName: attachment.filename,
+      isCollection: false,
+      contentLength: attachment.size,
+      lastModified: attachment.created_at,
+      contentType: attachment.mime,
+    })
+  }
   return entries
 }
 
@@ -465,6 +783,15 @@ async function handlePropfind(c: Context<AppBindings>): Promise<Response> {
       lastModified: target.folder.updated_at,
     })
     if (depth === 1) entries.push(...children)
+  } else if (target.kind === 'attachment') {
+    entries.push({
+      href: davHref(segments, false),
+      displayName: segments[segments.length - 1]!,
+      isCollection: false,
+      contentLength: target.attachment.size,
+      lastModified: target.attachment.created_at,
+      contentType: target.attachment.mime,
+    })
   } else {
     entries.push({
       href: davHref(segments, false),
@@ -483,6 +810,25 @@ async function handlePropfind(c: Context<AppBindings>): Promise<Response> {
 async function handleGet(c: Context<AppBindings>, headOnly: boolean): Promise<Response> {
   const segments = davSegments(c)
   const target = await resolveTarget(c.env.DB, c.get('userId'), segments)
+  if (target.kind === 'attachment') {
+    const row = target.attachment
+    const headers = new Headers({
+      'Content-Type': row.mime,
+      'Content-Length': String(row.size),
+      'Content-Disposition': `${isInlineSafe(row.mime) ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeContentDispositionFilename(row.filename)}`,
+      'Cache-Control': 'private, no-store',
+      'Last-Modified': formatHttpDate(row.created_at),
+      'X-Content-Type-Options': 'nosniff',
+    })
+    if (headOnly) return new Response(null, { status: 200, headers })
+    const object = await readAttachmentObjectStream(
+      c.env,
+      row.storage,
+      attachmentObjectKey({ user_id: c.get('userId'), id: row.id, mime: row.mime, filename: row.filename }),
+    )
+    if (!object) throw ApiError.notFound('Attachment data is missing')
+    return new Response(object.body as BodyInit, { status: 200, headers })
+  }
   if (target.kind !== 'note') throw ApiError.notFound('Content not found')
   const content = target.note.content
   const headers = {
@@ -522,6 +868,36 @@ async function readDavBody(c: Context<AppBindings>): Promise<string> {
   return new TextDecoder().decode(bytes)
 }
 
+/** Read a raw request body as bytes, capped at the attachment size limit. */
+async function readDavBytes(c: Context<AppBindings>): Promise<Uint8Array> {
+  const stream = c.req.raw?.body
+  if (!stream) return new Uint8Array(0)
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > LIMITS.attachmentMaxBytes) {
+        await reader.cancel()
+        throw ApiError.tooLarge('The file exceeds the 25 MB limit')
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
+}
+
 async function handlePut(c: Context<AppBindings>): Promise<Response> {
   const segments = davSegments(c)
   if (segments.length === 0) throw ApiError.conflict('Cannot write to a collection')
@@ -529,16 +905,134 @@ async function handlePut(c: Context<AppBindings>): Promise<Response> {
   if (target.kind === 'folder') throw ApiError.conflict('Cannot write to a collection')
   if (target.kind === 'broken') throw ApiError.conflict('The parent folder does not exist')
   const leaf = segments[segments.length - 1]!
-  if (!leaf.endsWith('.md')) throw ApiError.badRequest('Note files must end with .md')
-  const content = await readDavBody(c)
-  assertContentSize(content)
-  if (target.kind === 'note') {
-    await updateNoteContent(c, target.note, content)
+  if (leaf.endsWith('.md')) {
+    const content = await readDavBody(c)
+    assertContentSize(content)
+    if (target.kind === 'note') {
+      await updateNoteContent(c, target.note, content)
+      return new Response(null, { status: 204 })
+    }
+    if (target.kind !== 'absent') throw ApiError.conflict('Cannot write to a collection')
+    await insertNote(c, target.parentId, resolveDavTitle(leaf), content)
+    return new Response(null, { status: 201 })
+  }
+  if (target.kind === 'note') throw ApiError.conflict('Cannot write to a collection')
+  const bytes = await readDavBytes(c)
+  if (target.kind === 'attachment') {
+    await replaceDavAttachment(c, target.note, target.attachment, leaf, bytes)
     return new Response(null, { status: 204 })
   }
   if (target.kind !== 'absent') throw ApiError.conflict('Cannot write to a collection')
-  await insertNote(c, target.parentId, resolveDavTitle(leaf), content)
+  await createDavAttachment(c, target.parentId, leaf, bytes)
   return new Response(null, { status: 201 })
+}
+
+/**
+ * Store a new DAV attachment file. The file lives on a note titled with the
+ * file stem in the same folder; the note is created when missing, and its
+ * body holds a link to the attachment so the file survives orphan pruning.
+ */
+async function createDavAttachment(
+  c: Context<AppBindings>,
+  parentId: string | null,
+  leaf: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const db = c.env.DB
+  const userId = c.get('userId')
+  const title = davNoteTitleForFile(leaf)
+  if (title === null) throw ApiError.badRequest('Invalid file name')
+  const filename = sanitizeAttachmentFilename(leaf)
+  const reportedMime = davReportedMime(leaf, c.req.header('Content-Type'))
+  const existing = await loadNoteByTitle(db, userId, parentId, title)
+  if (!existing) {
+    const attachmentId = newId()
+    await insertNote(c, parentId, title, attachmentLinkLine(filename, attachmentId))
+    const note = await loadNoteByTitle(db, userId, parentId, title)
+    if (!note) throw ApiError.conflict('The note could not be created')
+    try {
+      await persistAttachmentWithinQuota(c.env, {
+        id: attachmentId,
+        userId,
+        noteId: note.id,
+        filename,
+        reportedMime,
+        bytes,
+        createdAt: Date.now(),
+      })
+    } catch (error) {
+      await trashNote(c, note).catch(() => {})
+      throw error
+    }
+    return
+  }
+  const attachmentId = newId()
+  const stored = await persistAttachmentWithinQuota(c.env, {
+    id: attachmentId,
+    userId,
+    noteId: existing.id,
+    filename,
+    reportedMime,
+    bytes,
+    createdAt: Date.now(),
+  })
+  try {
+    const fresh = await reloadNote(db, userId, existing.id)
+    if (!fresh) throw ApiError.conflict('The note could not be created')
+    await updateNoteContent(c, fresh, withAttachmentLink(fresh.content, filename, attachmentId))
+  } catch (error) {
+    await deleteAttachmentRow(c.env, userId, {
+      id: stored.id,
+      note_id: stored.noteId,
+      filename: stored.filename,
+      mime: stored.mime,
+      size: stored.size,
+      storage: stored.storage,
+      created_at: stored.createdAt,
+    }).catch(() => {})
+    throw error
+  }
+}
+
+/** Replace an existing DAV attachment file with new bytes (same path). */
+async function replaceDavAttachment(
+  c: Context<AppBindings>,
+  note: NoteRow,
+  oldRow: DavAttachmentRow,
+  leaf: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const db = c.env.DB
+  const userId = c.get('userId')
+  const filename = sanitizeAttachmentFilename(leaf)
+  const reportedMime = davReportedMime(leaf, c.req.header('Content-Type'))
+  const attachmentId = newId()
+  const stored = await persistAttachmentWithinQuota(c.env, {
+    id: attachmentId,
+    userId,
+    noteId: note.id,
+    filename,
+    reportedMime,
+    bytes,
+    createdAt: Date.now(),
+  })
+  try {
+    const fresh = await reloadNote(db, userId, note.id)
+    if (!fresh) throw ApiError.conflict('The note could not be created')
+    await updateNoteContent(c, fresh, withAttachmentLink(fresh.content, filename, attachmentId))
+  } catch (error) {
+    await deleteAttachmentRow(c.env, userId, {
+      id: stored.id,
+      note_id: stored.noteId,
+      filename: stored.filename,
+      mime: stored.mime,
+      size: stored.size,
+      storage: stored.storage,
+      created_at: stored.createdAt,
+    }).catch(() => {})
+    throw error
+  }
+  await deleteAttachmentRow(c.env, userId, oldRow)
 }
 
 async function insertNote(
@@ -792,12 +1286,66 @@ async function deleteFolderRow(c: Context<AppBindings>, folder: FolderRow): Prom
   await broadcastCursor(c)
 }
 
+/** Replace the link line for one attachment with a renamed file name. */
+export function renameAttachmentLink(
+  content: string,
+  oldFilename: string,
+  newFilename: string,
+  attachmentId: string,
+): string {
+  return content
+    .split('\n')
+    .map((line) => {
+      const match = DAV_ATTACHMENT_LINE_RE.exec(line.trim())
+      if (match && match[1] === oldFilename) {
+        return attachmentLinkLine(newFilename, attachmentId)
+      }
+      return line
+    })
+    .join('\n')
+}
+
+/**
+ * Delete a DAV attachment file. When its host note was created by DAV and
+ * nothing remains in it (no link lines, no other attachments), the empty
+ * note is trashed as well; user-written notes are kept, minus the link line.
+ */
+async function deleteDavAttachment(
+  c: Context<AppBindings>,
+  note: NoteRow,
+  attachment: DavAttachmentRow,
+): Promise<void> {
+  const db = c.env.DB
+  const userId = c.get('userId')
+  await deleteAttachmentRow(c.env, userId, attachment)
+  const fresh = await reloadNote(db, userId, note.id)
+  if (!fresh) return
+  const newContent = withoutAttachmentLink(fresh.content, attachment.filename)
+  const lines = parseDavAttachmentLines(fresh.content)
+  const remaining = await loadNoteAttachments(db, userId, note.id)
+  if (
+    lines !== null &&
+    remaining.length === 0 &&
+    (parseDavAttachmentLines(newContent)?.length ?? -1) === 0
+  ) {
+    await trashNote(c, fresh)
+    return
+  }
+  if (newContent !== fresh.content) {
+    await updateNoteContent(c, fresh, newContent)
+  }
+}
+
 async function handleDelete(c: Context<AppBindings>): Promise<Response> {
   const segments = davSegments(c)
   if (segments.length === 0) throw ApiError.forbidden('Cannot delete the root folder')
   const target = await resolveTarget(c.env.DB, c.get('userId'), segments)
   if (target.kind === 'note') {
     await trashNote(c, target.note)
+    return new Response(null, { status: 204 })
+  }
+  if (target.kind === 'attachment') {
+    await deleteDavAttachment(c, target.note, target.attachment)
     return new Response(null, { status: 204 })
   }
   if (target.kind === 'folder') {
@@ -813,7 +1361,9 @@ async function handleMkcol(c: Context<AppBindings>): Promise<Response> {
   const segments = davSegments(c)
   if (segments.length === 0) return methodNotAllowed()
   const target = await resolveTarget(c.env.DB, c.get('userId'), segments)
-  if (target.kind === 'folder' || target.kind === 'note') return methodNotAllowed()
+  if (target.kind === 'folder' || target.kind === 'note' || target.kind === 'attachment') {
+    return methodNotAllowed()
+  }
   if (target.kind === 'broken') throw ApiError.conflict('The parent folder does not exist')
   const leaf = segments[segments.length - 1]!
   if (leaf.endsWith('.md')) throw ApiError.badRequest('Folder names cannot end with .md')
@@ -898,6 +1448,7 @@ async function handleMoveCopy(c: Context<AppBindings>, method: 'MOVE' | 'COPY'):
     const destLeaf = destSegments[destSegments.length - 1]!
     if (!destLeaf.endsWith('.md')) throw ApiError.conflict('Destination must be a note file')
     if (dest.kind === 'folder') throw ApiError.conflict('Destination is a folder')
+    if (dest.kind === 'attachment') throw ApiError.conflict('Destination must be a note file')
     const title = resolveDavTitle(destLeaf)
     const destFolderId = dest.kind === 'note' ? dest.note.folder_id : dest.parentId
     let replaced = false
@@ -914,10 +1465,15 @@ async function handleMoveCopy(c: Context<AppBindings>, method: 'MOVE' | 'COPY'):
     }
     return new Response(null, { status: replaced ? 204 : 201 })
   }
+  if (source.kind === 'attachment') {
+    if (method === 'COPY') throw ApiError.forbidden('Copying an attachment is not supported')
+    return handleMoveAttachment(c, source, destSegments, dest, overwrite)
+  }
   if (method === 'COPY') throw ApiError.forbidden('Copying a folder is not supported')
   const destLeaf = destSegments[destSegments.length - 1]!
   if (destLeaf.endsWith('.md')) throw ApiError.badRequest('Destination must be a folder')
   if (dest.kind === 'note') throw ApiError.conflict('Destination is a note')
+  if (dest.kind === 'attachment') throw ApiError.conflict('Destination must be a folder')
   let replaced = false
   if (dest.kind === 'folder') {
     if (dest.folder.id === source.folder.id) return new Response(null, { status: 204 })
@@ -929,6 +1485,107 @@ async function handleMoveCopy(c: Context<AppBindings>, method: 'MOVE' | 'COPY'):
   }
   await moveFolder(c, source.folder, dest.kind === 'folder' ? dest.folder.parent_id : dest.parentId, destLeaf.trim())
   return new Response(null, { status: replaced ? 204 : 201 })
+}
+
+async function handleMoveAttachment(
+  c: Context<AppBindings>,
+  source: { note: NoteRow; attachment: DavAttachmentRow },
+  destSegments: string[],
+  dest: DavTarget,
+  overwrite: boolean,
+): Promise<Response> {
+  const db = c.env.DB
+  const userId = c.get('userId')
+  const destLeaf = destSegments[destSegments.length - 1]!
+  if (destLeaf.endsWith('.md')) throw ApiError.conflict('Destination must be a file')
+  if (dest.kind === 'folder') throw ApiError.conflict('Destination is a folder')
+  if (dest.kind === 'note') throw ApiError.conflict('Destination must be a file')
+  if (dest.kind === 'broken') throw ApiError.conflict('The destination parent folder does not exist')
+  if (dest.kind === 'root') throw ApiError.badRequest('Invalid Destination header')
+  const destParentId = dest.kind === 'attachment' ? dest.note.folder_id : dest.parentId
+  const srcNote = source.note
+  const srcAtt = source.attachment
+  const srcTitle = davNoteTitleForFile(srcAtt.filename)
+  const destTitle = davNoteTitleForFile(destLeaf)
+  if (srcTitle === null || destTitle === null) throw ApiError.badRequest('Invalid file name')
+  const newFilename = sanitizeAttachmentFilename(destLeaf)
+  const sameFolder = destParentId === srcNote.folder_id
+  const sameStem = destTitle === srcTitle
+
+  // Moving into a folder that already has a different note with the target
+  // title would silently merge the file into that note; refuse instead.
+  // The one exception is overwriting a DAV file whose host note will be
+  // trashed together with it, leaving the title free.
+  const clash = await loadNoteByTitle(db, userId, destParentId, destTitle)
+  if (clash && clash.id !== srcNote.id) {
+    let willVanish = false
+    if (dest.kind === 'attachment' && dest.note.id === clash.id) {
+      const clashLines = parseDavAttachmentLines(clash.content)
+      const clashAttachments = await loadNoteAttachments(db, userId, clash.id)
+      willVanish =
+        clashLines !== null &&
+        clashLines.length === 1 &&
+        clashLines[0]?.filename === dest.attachment.filename &&
+        clashAttachments.length === 1
+    }
+    if (!willVanish) {
+      throw ApiError.conflict('A note with the destination title already exists')
+    }
+  }
+
+  if (dest.kind === 'attachment') {
+    if (dest.attachment.id === srcAtt.id) return new Response(null, { status: 204 })
+    if (!overwrite) return preconditionFailed()
+    await deleteDavAttachment(c, dest.note, dest.attachment)
+  }
+
+  const fresh = await reloadNote(db, userId, srcNote.id)
+  if (!fresh) throw ApiError.notFound('Content not found')
+
+  if (sameFolder && sameStem) {
+    // Extension-only rename: the host note keeps its title and folder.
+    if (newFilename !== srcAtt.filename) {
+      await renameAttachmentFile(c.env, userId, srcAtt, newFilename)
+      const note = await reloadNote(db, userId, srcNote.id)
+      if (note) {
+        await updateNoteContent(
+          c,
+          note,
+          renameAttachmentLink(note.content, srcAtt.filename, newFilename, srcAtt.id),
+        )
+      }
+    }
+    return new Response(null, { status: 201 })
+  }
+
+  // Renaming the stem or moving across folders also renames/moves the host
+  // note, so the file keeps its path mapping. That is only safe for notes
+  // DAV created as attachment indexes; user-written notes are refused.
+  if (parseDavAttachmentLines(fresh.content) === null) {
+    throw ApiError.conflict('Cannot move this attachment because its note is not managed by WebDAV')
+  }
+  const srcStem = fileStem(srcAtt.filename)
+  const newStem = fileStem(newFilename)
+  const siblings = (await loadNoteAttachments(db, userId, srcNote.id)).filter(
+    (row) => fileStem(row.filename) === srcStem,
+  )
+  let content = fresh.content
+  for (const sibling of siblings) {
+    const extension = sibling.filename.slice((fileStem(sibling.filename) ?? '').length)
+    const siblingNew = sanitizeAttachmentFilename(`${newStem ?? ''}${extension}`)
+    if (siblingNew === sibling.filename) continue
+    await renameAttachmentFile(c.env, userId, sibling, siblingNew)
+    content = renameAttachmentLink(content, sibling.filename, siblingNew, sibling.id)
+  }
+  const noteAfterRename = await reloadNote(db, userId, srcNote.id)
+  if (!noteAfterRename) throw ApiError.notFound('Content not found')
+  if (content !== noteAfterRename.content) {
+    await updateNoteContent(c, noteAfterRename, content)
+  }
+  const noteAfterContent = await reloadNote(db, userId, srcNote.id)
+  if (!noteAfterContent) throw ApiError.notFound('Content not found')
+  await moveNote(c, noteAfterContent, destParentId, destTitle)
+  return new Response(null, { status: 201 })
 }
 
 async function moveNote(

@@ -124,10 +124,14 @@ export function sessionCookieString(requestUrl: string, token: string): string {
     `${secure ? SESSION_COOKIE : LEGACY_SESSION_COOKIE}=${token}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Lax',
+    // The Mini App runs inside Telegram Web's iframe (cross-site), where
+    // browsers drop SameSite=Lax third-party cookies, so a login there
+    // never sticks. SameSite=None + Partitioned (CHIPS) keeps the session
+    // usable in that iframe. Local http dev keeps Lax (None needs Secure).
+    secure ? 'SameSite=None' : 'SameSite=Lax',
     `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
   ]
-  if (secure) parts.push('Secure')
+  if (secure) parts.push('Secure', 'Partitioned')
   return parts.join('; ')
 }
 
@@ -143,19 +147,23 @@ export function clearSessionCookie(c: Context<AppBindings>): void {
       path: '/',
       httpOnly: true,
       maxAge: 0,
-      sameSite: 'Lax',
+      // Clear must match the attributes the cookie was set with.
+      sameSite: secure ? 'None' : 'Lax',
       secure,
+      ...(secure ? { partitioned: true } : {}),
     })
   }
 }
 
 function clearLegacySessionCookie(c: Context<AppBindings>): void {
+  const secure = new URL(c.req.url).protocol === 'https:'
   setCookie(c, LEGACY_SESSION_COOKIE, '', {
     path: '/',
     httpOnly: true,
     maxAge: 0,
-    sameSite: 'Lax',
-    secure: new URL(c.req.url).protocol === 'https:',
+    sameSite: secure ? 'None' : 'Lax',
+    secure,
+    ...(secure ? { partitioned: true } : {}),
   })
 }
 

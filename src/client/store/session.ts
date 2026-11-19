@@ -58,6 +58,26 @@ export const useSession = create<SessionState>((set, get) => ({
       if (sequence !== sessionRequestSequence) return
       await persistSession(info)
       if (sequence !== sessionRequestSequence) return
+      if (!info.user) {
+        // No session yet: inside the Telegram Mini App, try passwordless
+        // login with the WebApp initData before showing the login page.
+        // On the plain web app window.Telegram is absent, so nothing changes.
+        const initData = readTelegramInitData()
+        if (initData) {
+          try {
+            const tgInfo = await api.auth.telegram(initData)
+            if (sequence !== sessionRequestSequence) return
+            if (tgInfo.user) {
+              await persistSession(tgInfo)
+              if (sequence !== sessionRequestSequence) return
+              adopt(tgInfo, set)
+              return
+            }
+          } catch {
+            // Telegram login failed: fall through to the login page.
+          }
+        }
+      }
       adopt(info, set)
     } catch (err) {
       if (sequence !== sessionRequestSequence) return
@@ -373,6 +393,16 @@ function mergeSettingsPatches(
       ? { sync: { ...first.sync, ...second.sync } }
       : {}),
   }
+}
+
+interface TelegramWebAppWindow {
+  Telegram?: { WebApp?: { initData?: string } }
+}
+
+/** Raw initData query string from the Telegram Mini App, or '' on the web. */
+function readTelegramInitData(): string {
+  const initData = (window as unknown as TelegramWebAppWindow).Telegram?.WebApp?.initData
+  return typeof initData === 'string' ? initData : ''
 }
 
 function adopt(info: SessionInfo, set: (partial: Partial<SessionState>) => void): void {

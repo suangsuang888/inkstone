@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { DEFAULT_SETTINGS, mergeSettings, mergeSettingsPatch } from '@shared/constants'
 import type { PublicUser, SessionInfo, SiteInfo, TotpLoginChallenge, UserSettings } from '@shared/types'
-import { api, ApiError } from '../lib/api'
+import { api, ApiError, clearAuthToken, setAuthToken } from '../lib/api'
 import { getLocale, setLocale, t } from '../lib/i18n'
 import { localDb } from '../lib/db'
 import { applyThemeToDom, useUi } from './ui'
@@ -68,6 +68,10 @@ export const useSession = create<SessionState>((set, get) => ({
             const tgInfo = await api.auth.telegram(initData)
             if (sequence !== sessionRequestSequence) return
             if (tgInfo.user) {
+              // Keep the raw session token: this WebView drops the session
+              // cookie, so later requests (notes sync, …) authenticate with
+              // it as a Bearer header instead of the cookie.
+              if (tgInfo.sessionToken) setAuthToken(tgInfo.sessionToken)
               await persistSession(tgInfo)
               if (sequence !== sessionRequestSequence) return
               adopt(tgInfo, set)
@@ -265,6 +269,9 @@ export const useSession = create<SessionState>((set, get) => ({
       resetSettingsPersistence(null)
       await pendingSessionCache.catch(() => {})
       await localDb.clear()
+      // Drop the Bearer token too (after api.logout() above, which still
+      // needs it to destroy the server-side session).
+      clearAuthToken()
       set({ status: 'anonymous', user: null, settings: DEFAULT_SETTINGS })
       location.reload()
     })()

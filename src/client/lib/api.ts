@@ -46,6 +46,44 @@ export const CLIENT_ID =
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2)
 
+/**
+ * Session token for clients whose cookies don't stick (the Telegram Mini
+ * App on Android drops the session cookie). Only written by the Telegram
+ * auto-login flow; the plain web app never stores one, so its behaviour
+ * is unchanged. Sent as `Authorization: Bearer <token>` on every request
+ * while present.
+ */
+const AUTH_TOKEN_KEY = 'inkstone:telegram-session-token'
+
+export function getAuthToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function setAuthToken(token: string): void {
+  try {
+    localStorage.setItem(AUTH_TOKEN_KEY, token)
+  } catch {
+    // Storage unavailable: requests fall back to the session cookie.
+  }
+}
+
+export function clearAuthToken(): void {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+function applyAuthHeader(headers: Record<string, string>): void {
+  const token = getAuthToken()
+  if (token) headers['Authorization'] = `Bearer ${token}`
+}
+
 export class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -84,6 +122,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     'X-Inkstone-Origin': CLIENT_ID,
     'Accept-Language': getLocale(),
   }
+  applyAuthHeader(headers)
   let payload: BodyInit | undefined
   if (formData) {
     payload = formData
@@ -177,12 +216,14 @@ function isJsonResponse(response: Response): boolean {
 async function fetchDownload(path: string, fallbackName: string): Promise<{ response: Response; filename: string }> {
   let response: Response
   try {
+    const downloadHeaders: Record<string, string> = {
+      [CLIENT_HEADER]: '1',
+      'X-Inkstone-Origin': CLIENT_ID,
+      'Accept-Language': getLocale(),
+    }
+    applyAuthHeader(downloadHeaders)
     response = await fetch(path, {
-      headers: {
-        [CLIENT_HEADER]: '1',
-        'X-Inkstone-Origin': CLIENT_ID,
-        'Accept-Language': getLocale(),
-      },
+      headers: downloadHeaders,
       credentials: 'same-origin',
     })
   } catch {

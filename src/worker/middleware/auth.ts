@@ -48,6 +48,72 @@ interface SessionUserRow extends UserRow {
   last_seen_at: number
 }
 
+interface SessionLookup {
+  row: SessionUserRow
+  shouldRenew: boolean
+}
+
+/**
+ * Look a session up by its raw token: format check, hashed-id lookup,
+ * expiry check. A row whose user is gone is destroyed (stale session).
+ * Returns null when the token does not identify a live session.
+ */
+async function lookupSession(db: D1Database, token: string): Promise<SessionLookup | null> {
+  if (!isSessionToken(token)) return null
+  const row = await db
+    .prepare(
+      `SELECT ${USER_COLUMNS_ALIASED}, u.last_seen_at, s.id AS session_id, s.expires_at
+         FROM sessions s LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.id = ?1 AND s.expires_at > ?2`,
+    )
+    .bind(await hashToken(token), Date.now())
+    .first<SessionUserRow>()
+  if (!row?.session_id) return null
+  if (!row.id) {
+    await destroySession(db, token)
+    return null
+  }
+  return { row, shouldRenew: row.expires_at - Date.now() < SESSION_RENEW_BEFORE_MS }
+}
+
+/**
+ * Attach a looked-up session to the request: context vars, renewal,
+ * last_seen. `refreshCookie` writes the session cookie back (only for
+ * cookie-based auth, when the session was renewed or came from the
+ * legacy cookie name).
+ */
+async function applySession(
+  c: Context<AppBindings>,
+  token: string,
+  lookup: SessionLookup,
+  refreshCookie: boolean,
+): Promise<void> {
+  const { row, shouldRenew } = lookup
+  c.set('user', rowToUser(row))
+  c.set('userId', row.id)
+  c.set('sessionId', row.session_id)
+  if (shouldRenew) {
+    await renewSession(c.env.DB, row.session_id)
+  }
+  if (refreshCookie) {
+    writeSessionCookie(c, token)
+  }
+  const now = Date.now()
+  if (row.last_seen_at < now - 5 * 60 * 1000) c.executionCtx?.waitUntil(
+    c.env.DB.prepare(`UPDATE users SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at < ?3`)
+      .bind(now, row.id, now - 5 * 60 * 1000)
+      .run()
+      .catch(() => {}),
+  )
+}
+
+/** Parse an `Authorization: Bearer <token>` header, or null. */
+function bearerToken(header: string | undefined): string | null {
+  if (!header) return null
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim())
+  return match ? match[1]!.trim() : null
+}
+
 export const loadSession = createMiddleware<AppBindings>(async (c, next) => {
   const cookieNames = sessionCookieNames(c.req.url)
   const candidates = cookieNames
@@ -57,47 +123,35 @@ export const loadSession = createMiddleware<AppBindings>(async (c, next) => {
   let authenticated = false
 
   for (const { name, token } of candidates) {
-    if (!isSessionToken(token) || seenTokens.has(token)) continue
+    if (seenTokens.has(token)) continue
     seenTokens.add(token)
-    const row = await c.env.DB.prepare(
-      `SELECT ${USER_COLUMNS_ALIASED}, u.last_seen_at, s.id AS session_id, s.expires_at
-         FROM sessions s LEFT JOIN users u ON u.id = s.user_id
-        WHERE s.id = ?1 AND s.expires_at > ?2`,
-    )
-      .bind(await hashToken(token), Date.now())
-      .first<SessionUserRow>()
+    const lookup = await lookupSession(c.env.DB, token)
+    if (!lookup) continue
+    // Refresh the cookie when the session was renewed, or when the token
+    // came from the legacy cookie name (migrates it to the current name).
+    await applySession(c, token, lookup, lookup.shouldRenew || name === LEGACY_SESSION_COOKIE)
+    if (new URL(c.req.url).protocol === 'https:' && getCookie(c, LEGACY_SESSION_COOKIE)) {
+      clearLegacySessionCookie(c)
+    }
+    authenticated = true
+    break
+  }
 
-    if (row?.session_id) {
-      if (!row.id) {
-        await destroySession(c.env.DB, token)
-        continue
-      } else {
-        c.set('user', rowToUser(row))
-        c.set('userId', row.id)
-        c.set('sessionId', row.session_id)
-
-        const shouldRenew = row.expires_at - Date.now() < SESSION_RENEW_BEFORE_MS
-        if (shouldRenew) {
-          await renewSession(c.env.DB, row.session_id)
-        }
-        if (shouldRenew || name === LEGACY_SESSION_COOKIE) {
-          writeSessionCookie(c, token)
-        }
-        if (new URL(c.req.url).protocol === 'https:' && getCookie(c, LEGACY_SESSION_COOKIE)) {
-          clearLegacySessionCookie(c)
-        }
-        const now = Date.now()
-        if (row.last_seen_at < now - 5 * 60 * 1000) c.executionCtx?.waitUntil(
-          c.env.DB.prepare(`UPDATE users SET last_seen_at = ?1 WHERE id = ?2 AND last_seen_at < ?3`)
-            .bind(now, row.id, now - 5 * 60 * 1000)
-            .run()
-            .catch(() => {}),
-        )
+  if (!authenticated) {
+    // Bearer fallback: the Telegram Mini App (Android WebView) drops the
+    // session cookie, so the client sends the session token as an
+    // Authorization header instead. A missing or invalid token is simply
+    // anonymous, never an error.
+    const bearer = bearerToken(c.req.header('Authorization'))
+    if (bearer && !seenTokens.has(bearer)) {
+      const lookup = await lookupSession(c.env.DB, bearer)
+      if (lookup) {
+        await applySession(c, bearer, lookup, false)
         authenticated = true
-        break
       }
     }
   }
+
   if (candidates.length && !authenticated) clearSessionCookie(c)
 
   await next()

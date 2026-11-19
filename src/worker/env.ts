@@ -23,6 +23,12 @@ export interface Env {
 
   PUBLIC_URL?: string
 
+  /** Telegram bot token (Worker secret) used to verify Mini App initData. */
+  TELEGRAM_BOT_TOKEN?: string
+
+  /** Telegram user id of the admin allowed to auto-login from the Mini App. */
+  TELEGRAM_ADMIN_ID?: string
+
   /** Workers AI binding for semantic search; optional so AI search degrades gracefully. */
   AI?: {
     run: <T = unknown>(model: string, inputs: unknown) => Promise<T>

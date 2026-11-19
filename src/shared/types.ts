@@ -35,6 +35,14 @@ export interface SessionInfo {
   user: PublicUser | null
   site: SiteInfo
   settings: UserSettings | null
+  /**
+   * Raw session token, only returned by the Telegram Mini App login
+   * (POST /api/auth/telegram). The Mini App's WebView drops the session
+   * cookie, so the client keeps this token and sends it as an
+   * `Authorization: Bearer` header instead. Never returned by the
+   * password login.
+   */
+  sessionToken?: string
 }
 
 export interface TotpLoginChallenge {

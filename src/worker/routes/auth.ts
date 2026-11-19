@@ -276,7 +276,9 @@ authRoutes.post('/telegram', async (c) => {
 
   const token = await rotateSession(c, owner.id)
   writeSessionCookie(c, token)
-  return c.json(await sessionInfo(c.env, rowToUser(owner)))
+  // Also return the raw token: the Mini App's WebView drops the session
+  // cookie, so the client stores this and sends it as a Bearer header.
+  return c.json({ ...(await sessionInfo(c.env, rowToUser(owner))), sessionToken: token })
 })
 
 

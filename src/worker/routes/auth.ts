@@ -33,6 +33,7 @@ import { JSON_BODY_LIMITS, readJson, requestClientIp } from '../lib/request'
 import { commitChange } from '../lib/notify'
 import { createSession, destroyOtherSessions, destroySession } from '../lib/session-store'
 import { createTotpLoginChallenge, hasEnabledTotp } from '../lib/totp-service'
+import { verifyTelegramInitData } from '../lib/telegram-auth'
 import {
   assertNotLocked,
   clearLoginFailures,
@@ -238,6 +239,44 @@ authRoutes.post('/login', async (c) => {
   const token = await rotateSession(c, row.id)
   writeSessionCookie(c, token)
   return c.json(await sessionInfo(c.env, rowToUser(row)))
+})
+
+/**
+ * Passwordless sign-in for the Telegram Mini App. The client sends the raw
+ * WebApp initData; Telegram's HMAC signature proves the request comes from
+ * the admin's own Telegram account, so no password (and no TOTP challenge)
+ * is needed here. The web app keeps password login unchanged.
+ * Only the configured admin Telegram user id may use this endpoint, and
+ * the session is always created for the instance's owner account.
+ */
+authRoutes.post('/telegram', async (c) => {
+  const body = await readJson<{ initData?: string }>(c, 8192)
+  const initData = typeof body.initData === 'string' ? body.initData : ''
+  if (!initData) throw ApiError.badRequest('Missing initData')
+
+  const botToken = c.env.TELEGRAM_BOT_TOKEN
+  const adminId = c.env.TELEGRAM_ADMIN_ID
+  if (!botToken || !adminId) {
+    throw new ApiError(503, 'server_misconfigured', 'Telegram login is not configured on this instance')
+  }
+
+  const result = await verifyTelegramInitData(initData, botToken)
+  if (!result.ok) {
+    if (result.error === 'malformed') throw ApiError.badRequest('Invalid Telegram init data')
+    throw ApiError.unauthenticated('Telegram verification failed')
+  }
+  if (String(result.user.id) !== adminId.trim()) {
+    throw ApiError.unauthenticated('Telegram verification failed')
+  }
+
+  const owner = await c.env.DB.prepare(
+    `SELECT ${USER_COLUMNS} FROM users WHERE role = 'owner' ORDER BY created_at ASC LIMIT 1`,
+  ).first<Parameters<typeof rowToUser>[0]>()
+  if (!owner) throw ApiError.unauthenticated('Telegram verification failed')
+
+  const token = await rotateSession(c, owner.id)
+  writeSessionCookie(c, token)
+  return c.json(await sessionInfo(c.env, rowToUser(owner)))
 })
 
 

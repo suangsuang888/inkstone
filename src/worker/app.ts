@@ -40,7 +40,11 @@ export function createApp() {
     // (No X-Frame-Options header: CSP frame-ancestors is the control.)
     c.header(
       'Content-Security-Policy',
-        "default-src 'self'; base-uri 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+        // script-src allows telegram.org: the Telegram Mini App needs the
+        // official telegram-web-app.js to expose window.Telegram.WebApp
+        // (used for passwordless auto-login). Nothing else is loaded
+        // from there.
+        "default-src 'self'; base-uri 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; style-src 'self' 'unsafe-inline'; " +
         `img-src 'self' data: blob: ${imageSchemes}; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; ` +
         `manifest-src 'self'; media-src 'self' blob:; form-action ${formAction}; frame-src 'none'; ` +
         "frame-ancestors 'self' https://web.telegram.org https://telegram.org; object-src 'none'",

@@ -277,6 +277,10 @@ export const api = {
       }),
     login: (username: string, password: string) =>
       request<PasswordLoginResult>('/api/auth/login', { method: 'POST', body: { username, password } }),
+    // Passwordless sign-in for the Telegram Mini App: the server verifies
+    // the WebApp initData signature and creates a session for the owner.
+    telegram: (initData: string) =>
+      request<SessionInfo>('/api/auth/telegram', { method: 'POST', body: { initData } }),
     totp: {
       status: () => request<TotpStatus>('/api/auth/totp/status'),
       startSetup: (currentPassword: string) =>
